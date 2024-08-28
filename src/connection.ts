@@ -2036,6 +2036,7 @@ class Connection extends EventEmitter {
         process.nextTick(() => {
           if (err instanceof ConnectionError) {
             this.emit('connect', err);
+            this.transitionTo(this.STATE.FINAL);
           } else {
             this.socketError(err as Error);
           }
