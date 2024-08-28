@@ -1977,7 +1977,11 @@ class Connection extends EventEmitter {
         } catch (err) {
           socket.destroy();
 
-          throw err;
+          // Wrap the error message the same way `this.socketError()` would do
+          const message = `Connection lost - ${(err as Error).message}`;
+          this.debug.log(message);
+
+          throw new ConnectionError(message, 'ESOCKET', { cause: err });
         }
 
         // From here on out, socket errors are handled via the legacy methods
