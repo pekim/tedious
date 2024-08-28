@@ -1960,7 +1960,67 @@ class Connection extends EventEmitter {
         }
 
         const socket = await this.connectOnPort(port, this.config.options.multiSubnetFailover, signal, this.config.options.connector);
-        await this.socketHandlingForSendPreLogin(socket);
+        socket.setKeepAlive(true, KEEP_ALIVE_INITIAL_DELAY);
+
+        this.closed = false;
+        this.debug.log('connected to ' + this.config.server + ':' + this.config.options.port);
+
+        let preloginPayload;
+        try {
+          await this.sendPreLogin(socket);
+          this.transitionTo(this.STATE.SENT_PRELOGIN);
+
+          preloginPayload = await this.readPreLoginResponse(socket);
+          if (preloginPayload.fedAuthRequired === 1) {
+            this.fedAuthRequired = true;
+          }
+        } catch (err) {
+          socket.destroy();
+
+          throw err;
+        }
+
+        // From here on out, socket errors are handled via the legacy methods
+        socket.on('error', (error) => { this.socketError(error); });
+        socket.on('close', () => { this.socketClose(); });
+        socket.on('end', () => { this.socketEnd(); });
+
+        this.messageIo = new MessageIO(socket, this.config.options.packetSize, this.debug);
+        this.messageIo.on('secure', (cleartext) => { this.emit('secure', cleartext); });
+
+        this.socket = socket;
+
+        if ('strict' !== this.config.options.encrypt && (preloginPayload.encryptionString === 'ON' || preloginPayload.encryptionString === 'REQ')) {
+          if (!this.config.options.encrypt) {
+            throw new ConnectionError("Server requires encryption, set 'encrypt' config option to true.", 'EENCRYPT');
+          }
+
+          this.transitionTo(this.STATE.SENT_TLSSSLNEGOTIATION);
+          await this.messageIo.startTls(this.secureContextOptions, this.config.options.serverName ? this.config.options.serverName : this.routingData?.server ?? this.config.server, this.config.options.trustServerCertificate);
+        }
+
+        process.nextTick(() => {
+          this.sendLogin7Packet();
+
+          const { authentication } = this.config;
+
+          switch (authentication.type) {
+            case 'token-credential':
+            case 'azure-active-directory-password':
+            case 'azure-active-directory-msi-vm':
+            case 'azure-active-directory-msi-app-service':
+            case 'azure-active-directory-service-principal-secret':
+            case 'azure-active-directory-default':
+              this.transitionTo(this.STATE.SENT_LOGIN7_WITH_FEDAUTH);
+              break;
+            case 'ntlm':
+              this.transitionTo(this.STATE.SENT_LOGIN7_WITH_NTLM);
+              break;
+            default:
+              this.transitionTo(this.STATE.SENT_LOGIN7_WITH_STANDARD_LOGIN);
+              break;
+          }
+        });
       } catch (err) {
         this.clearConnectTimer();
 
@@ -2025,61 +2085,6 @@ class Connection extends EventEmitter {
    */
   createTokenStreamParser(message: Message, handler: TokenHandler) {
     return new TokenStreamParser(message, this.debug, handler, this.config.options);
-  }
-
-  async socketHandlingForSendPreLogin(socket: net.Socket) {
-    this.closed = false;
-    this.debug.log('connected to ' + this.config.server + ':' + this.config.options.port);
-
-    await this.sendPreLogin(socket);
-    this.transitionTo(this.STATE.SENT_PRELOGIN);
-
-    const preloginPayload = await this.readPreLoginResponse(socket);
-    if (preloginPayload.fedAuthRequired === 1) {
-      this.fedAuthRequired = true;
-    }
-
-    socket.on('error', (error) => { this.socketError(error); });
-    socket.on('close', () => { this.socketClose(); });
-    socket.on('end', () => { this.socketEnd(); });
-    socket.setKeepAlive(true, KEEP_ALIVE_INITIAL_DELAY);
-
-    this.messageIo = new MessageIO(socket, this.config.options.packetSize, this.debug);
-    this.messageIo.on('secure', (cleartext) => { this.emit('secure', cleartext); });
-
-    this.socket = socket;
-
-    if ('strict' !== this.config.options.encrypt && (preloginPayload.encryptionString === 'ON' || preloginPayload.encryptionString === 'REQ')) {
-      if (!this.config.options.encrypt) {
-        throw new ConnectionError("Server requires encryption, set 'encrypt' config option to true.", 'EENCRYPT');
-      }
-
-      this.transitionTo(this.STATE.SENT_TLSSSLNEGOTIATION);
-      await this.messageIo.startTls(this.secureContextOptions, this.config.options.serverName ? this.config.options.serverName : this.routingData?.server ?? this.config.server, this.config.options.trustServerCertificate);
-    }
-
-    process.nextTick(() => {
-      this.sendLogin7Packet();
-
-      const { authentication } = this.config;
-
-      switch (authentication.type) {
-        case 'token-credential':
-        case 'azure-active-directory-password':
-        case 'azure-active-directory-msi-vm':
-        case 'azure-active-directory-msi-app-service':
-        case 'azure-active-directory-service-principal-secret':
-        case 'azure-active-directory-default':
-          this.transitionTo(this.STATE.SENT_LOGIN7_WITH_FEDAUTH);
-          break;
-        case 'ntlm':
-          this.transitionTo(this.STATE.SENT_LOGIN7_WITH_NTLM);
-          break;
-        default:
-          this.transitionTo(this.STATE.SENT_LOGIN7_WITH_STANDARD_LOGIN);
-          break;
-      }
-    });
   }
 
   wrapWithTls(socket: net.Socket, signal: AbortSignal): Promise<tls.TLSSocket> {
