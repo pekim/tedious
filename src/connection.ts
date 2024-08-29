@@ -2063,6 +2063,9 @@ class Connection extends EventEmitter {
   cleanupConnection(cleanupType: typeof CLEANUP_TYPE[keyof typeof CLEANUP_TYPE]) {
     this.closeController.abort(new ConnectionError('Connection closed.', 'ECLOSE'));
 
+    // Create a new AbortController to allow retrying to work properly
+    this.closeController = new AbortController();
+
     if (!this.closed) {
       this.clearConnectTimer();
       this.clearRequestTimer();
