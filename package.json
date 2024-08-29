@@ -80,7 +80,8 @@
     "semantic-release": "^22.0.12",
     "sinon": "^15.2.0",
     "typedoc": "^0.26.6",
-    "typescript": "^5.5.4"
+    "typescript": "^5.5.4",
+    "wtfnode": "^0.9.3"
   },
   "scripts": {
     "docs": "typedoc",
@@ -124,6 +125,7 @@
     ]
   },
   "mocha": {
+    "nodeOption": "require=wtfnode",
     "require": "test/setup.js",
     "timeout": 5000,
     "extension": [
