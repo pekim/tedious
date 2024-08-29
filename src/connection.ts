@@ -1047,6 +1047,8 @@ class Connection extends EventEmitter {
    */
   declare databaseCollation: Collation | undefined;
 
+  declare closeController: AbortController;
+
   /**
    * Note: be aware of the different options field:
    * 1. config.authentication.options
@@ -1766,6 +1768,7 @@ class Connection extends EventEmitter {
     this.transientErrorLookup = new TransientErrorLookup();
 
     this.state = this.STATE.INITIALIZED;
+    this.closeController = new AbortController();
 
     this._cancelAfterRequestSent = () => {
       this.messageIo.sendMessage(TYPE.ATTENTION);
@@ -1940,7 +1943,10 @@ class Connection extends EventEmitter {
    * @private
    */
   initialiseConnection() {
-    const signal = this.createConnectTimer();
+    const timeoutSignal = this.createConnectTimer();
+    const closeSignal = this.closeController.signal;
+
+    const signal = AbortSignal.any([timeoutSignal, closeSignal]);
 
     (async () => {
       try {
@@ -1968,9 +1974,15 @@ class Connection extends EventEmitter {
         let preloginPayload;
         try {
           await this.sendPreLogin(socket);
+          // TODO: Add proper signal handling to `this.sendPreLogin` and remove this
+          signal.throwIfAborted();
+
           this.transitionTo(this.STATE.SENT_PRELOGIN);
 
           preloginPayload = await this.readPreLoginResponse(socket);
+          // TODO: Add proper signal handling to `this.readPreLoginResponse` and remove this
+          signal.throwIfAborted();
+
           if (preloginPayload.fedAuthRequired === 1) {
             this.fedAuthRequired = true;
           }
@@ -2049,6 +2061,8 @@ class Connection extends EventEmitter {
    * @private
    */
   cleanupConnection(cleanupType: typeof CLEANUP_TYPE[keyof typeof CLEANUP_TYPE]) {
+    this.closeController.abort(new ConnectionError('Connection closed.', 'ECLOSE'));
+
     if (!this.closed) {
       this.clearConnectTimer();
       this.clearRequestTimer();
