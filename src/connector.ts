@@ -85,6 +85,9 @@ export async function connectInSequence(options: { host: string, port: number, l
   for (const address of addresses) {
     try {
       return await new Promise<net.Socket>((resolve, reject) => {
+        const startTime = process.hrtime();
+        console.log('connecting to', address, startTime);
+
         const socket = net.connect({
           ...options,
           host: address.address,
@@ -97,6 +100,8 @@ export async function connectInSequence(options: { host: string, port: number, l
 
           socket.destroy();
 
+          console.log('aborted', address, process.hrtime(startTime));
+
           reject(signal.reason);
         };
 
@@ -108,6 +113,8 @@ export async function connectInSequence(options: { host: string, port: number, l
 
           socket.destroy();
 
+          console.log('errored', address, process.hrtime(startTime));
+
           reject(err);
         };
 
@@ -117,6 +124,7 @@ export async function connectInSequence(options: { host: string, port: number, l
           socket.removeListener('error', onError);
           socket.removeListener('connect', onConnect);
 
+          console.log('connected to', address, process.hrtime(startTime));
           resolve(socket);
         };
 

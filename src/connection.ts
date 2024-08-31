@@ -1969,8 +1969,7 @@ class Connection extends EventEmitter {
         }
 
         const socket = await this.connectOnPort(port, this.config.options.multiSubnetFailover, signal, this.config.options.connector);
-        const connectedAfter = process.hrtime(connectionStartTime);
-        console.log('socket connected after: ', connectedAfter[0]);
+        console.log('socket connected after: ', process.hrtime(connectionStartTime));
         socket.setKeepAlive(true, KEEP_ALIVE_INITIAL_DELAY);
 
         this.closed = false;
