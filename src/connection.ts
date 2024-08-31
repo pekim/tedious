@@ -1949,6 +1949,8 @@ class Connection extends EventEmitter {
     const signal = AbortSignal.any([timeoutSignal, closeSignal]);
 
     (async () => {
+      console.log('opening connection');
+
       try {
         let port = this.config.options.port;
 
@@ -1966,6 +1968,7 @@ class Connection extends EventEmitter {
         }
 
         const socket = await this.connectOnPort(port, this.config.options.multiSubnetFailover, signal, this.config.options.connector);
+        console.log('socket connected');
         socket.setKeepAlive(true, KEEP_ALIVE_INITIAL_DELAY);
 
         this.closed = false;
@@ -1973,6 +1976,7 @@ class Connection extends EventEmitter {
 
         let preloginPayload;
         try {
+          console.log('sending prelogin');
           await this.sendPreLogin(socket);
           // TODO: Add proper signal handling to `this.sendPreLogin` and remove this
           signal.throwIfAborted();
