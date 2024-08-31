@@ -1950,6 +1950,7 @@ class Connection extends EventEmitter {
 
     (async () => {
       console.log('opening connection');
+      const connectionStartTime = process.hrtime();
 
       try {
         let port = this.config.options.port;
@@ -1968,7 +1969,8 @@ class Connection extends EventEmitter {
         }
 
         const socket = await this.connectOnPort(port, this.config.options.multiSubnetFailover, signal, this.config.options.connector);
-        console.log('socket connected');
+        const connectedAfter = process.hrtime(connectionStartTime);
+        console.log('socket connected after: ', connectedAfter[0]);
         socket.setKeepAlive(true, KEEP_ALIVE_INITIAL_DELAY);
 
         this.closed = false;
