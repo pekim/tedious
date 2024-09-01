@@ -1047,6 +1047,8 @@ class Connection extends EventEmitter {
    */
   declare databaseCollation: Collation | undefined;
 
+  declare closeController: AbortController;
+
   /**
    * Note: be aware of the different options field:
    * 1. config.authentication.options
@@ -1766,6 +1768,7 @@ class Connection extends EventEmitter {
     this.transientErrorLookup = new TransientErrorLookup();
 
     this.state = this.STATE.INITIALIZED;
+    this.closeController = new AbortController();
 
     this._cancelAfterRequestSent = () => {
       this.messageIo.sendMessage(TYPE.ATTENTION);
@@ -1940,21 +1943,106 @@ class Connection extends EventEmitter {
    * @private
    */
   initialiseConnection() {
-    const signal = this.createConnectTimer();
+    const timeoutSignal = this.createConnectTimer();
+    const closeSignal = this.closeController.signal;
 
-    if (this.config.options.port) {
-      return this.connectOnPort(this.config.options.port, this.config.options.multiSubnetFailover, signal, this.config.options.connector);
-    } else {
-      return instanceLookup({
-        server: this.config.server,
-        instanceName: this.config.options.instanceName!,
-        timeout: this.config.options.connectTimeout,
-        signal: signal
-      }).then((port) => {
+    const signal = AbortSignal.any([timeoutSignal, closeSignal]);
+
+    (async () => {
+      console.log('opening connection');
+      const connectionStartTime = process.hrtime();
+
+      try {
+        let port = this.config.options.port;
+
+        if (!port) {
+          try {
+            port = await instanceLookup({
+              server: this.config.server,
+              instanceName: this.config.options.instanceName!,
+              timeout: this.config.options.connectTimeout,
+              signal: signal
+            });
+          } catch (err) {
+            throw new ConnectionError((err as Error).message, 'EINSTLOOKUP', { cause: err });
+          }
+        }
+
+        const socket = await this.connectOnPort(port, this.config.options.multiSubnetFailover, signal, this.config.options.connector);
+        console.log('socket connected after: ', process.hrtime(connectionStartTime));
+        socket.setKeepAlive(true, KEEP_ALIVE_INITIAL_DELAY);
+
+        this.closed = false;
+        this.debug.log('connected to ' + this.config.server + ':' + this.config.options.port);
+
+        let preloginPayload;
+        try {
+          console.log('sending prelogin');
+          await this.sendPreLogin(socket);
+          // TODO: Add proper signal handling to `this.sendPreLogin` and remove this
+          signal.throwIfAborted();
+
+          this.transitionTo(this.STATE.SENT_PRELOGIN);
+
+          preloginPayload = await this.readPreLoginResponse(socket);
+          // TODO: Add proper signal handling to `this.readPreLoginResponse` and remove this
+          signal.throwIfAborted();
+
+          if (preloginPayload.fedAuthRequired === 1) {
+            this.fedAuthRequired = true;
+          }
+        } catch (err) {
+          socket.destroy();
+
+          // Wrap the error message the same way `this.socketError()` would do
+          const message = `Connection lost - ${(err as Error).message}`;
+          this.debug.log(message);
+
+          throw new ConnectionError(message, 'ESOCKET', { cause: err });
+        }
+
+        // From here on out, socket errors are handled via the legacy methods
+        socket.on('error', (error) => { this.socketError(error); });
+        socket.on('close', () => { this.socketClose(); });
+        socket.on('end', () => { this.socketEnd(); });
+
+        this.messageIo = new MessageIO(socket, this.config.options.packetSize, this.debug);
+        this.messageIo.on('secure', (cleartext) => { this.emit('secure', cleartext); });
+
+        this.socket = socket;
+
+        if ('strict' !== this.config.options.encrypt && (preloginPayload.encryptionString === 'ON' || preloginPayload.encryptionString === 'REQ')) {
+          if (!this.config.options.encrypt) {
+            throw new ConnectionError("Server requires encryption, set 'encrypt' config option to true.", 'EENCRYPT');
+          }
+
+          this.transitionTo(this.STATE.SENT_TLSSSLNEGOTIATION);
+          await this.messageIo.startTls(this.secureContextOptions, this.config.options.serverName ? this.config.options.serverName : this.routingData?.server ?? this.config.server, this.config.options.trustServerCertificate);
+        }
+
         process.nextTick(() => {
-          this.connectOnPort(port, this.config.options.multiSubnetFailover, signal, this.config.options.connector);
+          this.sendLogin7Packet();
+
+          const { authentication } = this.config;
+
+          switch (authentication.type) {
+            case 'token-credential':
+            case 'azure-active-directory-password':
+            case 'azure-active-directory-msi-vm':
+            case 'azure-active-directory-msi-app-service':
+            case 'azure-active-directory-service-principal-secret':
+            case 'azure-active-directory-default':
+              this.transitionTo(this.STATE.SENT_LOGIN7_WITH_FEDAUTH);
+              break;
+            case 'ntlm':
+              this.transitionTo(this.STATE.SENT_LOGIN7_WITH_NTLM);
+              break;
+            default:
+              this.transitionTo(this.STATE.SENT_LOGIN7_WITH_STANDARD_LOGIN);
+              break;
+          }
         });
-      }, (err) => {
+      } catch (err) {
         this.clearConnectTimer();
 
         if (signal.aborted) {
@@ -1963,16 +2051,26 @@ class Connection extends EventEmitter {
         }
 
         process.nextTick(() => {
-          this.emit('connect', new ConnectionError(err.message, 'EINSTLOOKUP', { cause: err }));
+          if (err instanceof ConnectionError) {
+            this.emit('connect', err);
+            this.transitionTo(this.STATE.FINAL);
+          } else {
+            this.socketError(err as Error);
+          }
         });
-      });
-    }
+      }
+    })();
   }
 
   /**
    * @private
    */
   cleanupConnection(cleanupType: typeof CLEANUP_TYPE[keyof typeof CLEANUP_TYPE]) {
+    this.closeController.abort(new ConnectionError('Connection closed.', 'ECLOSE'));
+
+    // Create a new AbortController to allow retrying to work properly
+    this.closeController = new AbortController();
+
     if (!this.closed) {
       this.clearConnectTimer();
       this.clearRequestTimer();
@@ -2014,24 +2112,6 @@ class Connection extends EventEmitter {
    */
   createTokenStreamParser(message: Message, handler: TokenHandler) {
     return new TokenStreamParser(message, this.debug, handler, this.config.options);
-  }
-
-  socketHandlingForSendPreLogin(socket: net.Socket) {
-    socket.on('error', (error) => { this.socketError(error); });
-    socket.on('close', () => { this.socketClose(); });
-    socket.on('end', () => { this.socketEnd(); });
-    socket.setKeepAlive(true, KEEP_ALIVE_INITIAL_DELAY);
-
-    this.messageIo = new MessageIO(socket, this.config.options.packetSize, this.debug);
-    this.messageIo.on('secure', (cleartext) => { this.emit('secure', cleartext); });
-
-    this.socket = socket;
-
-    this.closed = false;
-    this.debug.log('connected to ' + this.config.server + ':' + this.config.options.port);
-
-    this.sendPreLogin();
-    this.transitionTo(this.STATE.SENT_PRELOGIN);
   }
 
   wrapWithTls(socket: net.Socket, signal: AbortSignal): Promise<tls.TLSSocket> {
@@ -2089,7 +2169,7 @@ class Connection extends EventEmitter {
     });
   }
 
-  connectOnPort(port: number, multiSubnetFailover: boolean, signal: AbortSignal, customConnector?: () => Promise<net.Socket>) {
+  async connectOnPort(port: number, multiSubnetFailover: boolean, signal: AbortSignal, customConnector?: () => Promise<net.Socket>): Promise<net.Socket> {
     const connectOpts = {
       host: this.routingData ? this.routingData.server : this.config.server,
       port: this.routingData ? this.routingData.port : port,
@@ -2098,30 +2178,20 @@ class Connection extends EventEmitter {
 
     const connect = customConnector || (multiSubnetFailover ? connectInParallel : connectInSequence);
 
-    (async () => {
-      let socket = await connect(connectOpts, dns.lookup, signal);
+    let socket = await connect(connectOpts, dns.lookup, signal);
 
-      if (this.config.options.encrypt === 'strict') {
-        try {
-          // Wrap the socket with TLS for TDS 8.0
-          socket = await this.wrapWithTls(socket, signal);
-        } catch (err) {
-          socket.end();
+    if (this.config.options.encrypt === 'strict') {
+      try {
+        // Wrap the socket with TLS for TDS 8.0
+        socket = await this.wrapWithTls(socket, signal);
+      } catch (err) {
+        socket.end();
 
-          throw err;
-        }
+        throw err;
       }
+    }
 
-      this.socketHandlingForSendPreLogin(socket);
-    })().catch((err) => {
-      this.clearConnectTimer();
-
-      if (signal.aborted) {
-        return;
-      }
-
-      process.nextTick(() => { this.socketError(err); });
-    });
+    return socket;
   }
 
   /**
@@ -2375,7 +2445,7 @@ class Connection extends EventEmitter {
   /**
    * @private
    */
-  sendPreLogin() {
+  async sendPreLogin(socket: net.Socket) {
     const [, major, minor, build] = /^(\d+)\.(\d+)\.(\d+)/.exec(version) ?? ['0.0.0', '0', '0', '0'];
     const payload = new PreloginPayload({
       // If encrypt setting is set to 'strict', then we should have already done the encryption before calling
@@ -2385,10 +2455,23 @@ class Connection extends EventEmitter {
       version: { major: Number(major), minor: Number(minor), build: Number(build), subbuild: 0 }
     });
 
-    this.messageIo.sendMessage(TYPE.PRELOGIN, payload.data);
+    await MessageIO.writeMessage(socket, this.debug, this.config.options.packetSize, TYPE.PRELOGIN, [ payload.data ]);
     this.debug.payload(function() {
       return payload.toString('  ');
     });
+  }
+
+  async readPreLoginResponse(socket: net.Socket) {
+    let messageBuffer = Buffer.alloc(0);
+    for await (const data of MessageIO.readMessage(socket, this.debug)) {
+      messageBuffer = Buffer.concat([messageBuffer, data]);
+    }
+
+    const preloginPayload = new PreloginPayload(messageBuffer);
+    this.debug.payload(function() {
+      return preloginPayload.toString('  ');
+    });
+    return preloginPayload;
   }
 
   /**
@@ -3281,69 +3364,6 @@ Connection.prototype.STATE = {
   },
   SENT_PRELOGIN: {
     name: 'SentPrelogin',
-    enter: function() {
-      (async () => {
-        let messageBuffer = Buffer.alloc(0);
-
-        let message;
-        try {
-          message = await this.messageIo.readMessage();
-        } catch (err: any) {
-          return this.socketError(err);
-        }
-
-        for await (const data of message) {
-          messageBuffer = Buffer.concat([messageBuffer, data]);
-        }
-
-        const preloginPayload = new PreloginPayload(messageBuffer);
-        this.debug.payload(function() {
-          return preloginPayload.toString('  ');
-        });
-
-        if (preloginPayload.fedAuthRequired === 1) {
-          this.fedAuthRequired = true;
-        }
-        if ('strict' !== this.config.options.encrypt && (preloginPayload.encryptionString === 'ON' || preloginPayload.encryptionString === 'REQ')) {
-          if (!this.config.options.encrypt) {
-            this.emit('connect', new ConnectionError("Server requires encryption, set 'encrypt' config option to true.", 'EENCRYPT'));
-            return this.close();
-          }
-
-          try {
-            this.transitionTo(this.STATE.SENT_TLSSSLNEGOTIATION);
-            await this.messageIo.startTls(this.secureContextOptions, this.config.options.serverName ? this.config.options.serverName : this.routingData?.server ?? this.config.server, this.config.options.trustServerCertificate);
-          } catch (err: any) {
-            return this.socketError(err);
-          }
-        }
-
-        this.sendLogin7Packet();
-
-        const { authentication } = this.config;
-
-        switch (authentication.type) {
-          case 'token-credential':
-          case 'azure-active-directory-password':
-          case 'azure-active-directory-msi-vm':
-          case 'azure-active-directory-msi-app-service':
-          case 'azure-active-directory-service-principal-secret':
-          case 'azure-active-directory-default':
-            this.transitionTo(this.STATE.SENT_LOGIN7_WITH_FEDAUTH);
-            break;
-          case 'ntlm':
-            this.transitionTo(this.STATE.SENT_LOGIN7_WITH_NTLM);
-            break;
-          default:
-            this.transitionTo(this.STATE.SENT_LOGIN7_WITH_STANDARD_LOGIN);
-            break;
-        }
-      })().catch((err) => {
-        process.nextTick(() => {
-          throw err;
-        });
-      });
-    },
     events: {
       socketError: function() {
         this.transitionTo(this.STATE.FINAL);
